@@ -1,0 +1,854 @@
+---
+title: "Bayesian Optimization"
+author: "Arga Adyatama"
+date: "12/29/2019"
+output: 
+ html_document:
+   toc: true
+   toc_float: 
+    collapsed: false
+   number_sections: true
+   toc_depth: 3
+   theme: flatly
+   highlight: breezedark
+   df_print: paged
+   code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction {.tabset .tabset-fade .tabset-pills}
+
+Optimization is important in many fields, including in data science. In manufacturing, where every decision is critical to the process and the profit of organization, optimization is often employed, from the number of each products produced, how the unit is scheduled for production, get the best or optimal process parameter, and also the routing determination such as the traveling salesman problem. In data science, we are familiar with model tuning, where we tune our model in order to improve the model performance. Optimization algorithm can help us to get a better model performance. 
+
+Bayesian Optimization is one of many optimization algorithm that can be employed to various cases. Bayesian Optimization employ a probabilistic model to optimize the fitness function. The advantage of Bayesian Optimization is when evaluations of the fitness function are expensive to perform — as is the case when it requires training a machine learning algorithm — it is easy to justify some extra computation to make better decisions[^1]. It is best-suited for optimization over continuous domains of less than 20 dimensions, and tolerates stochastic noise in function evaluations[^2].
+
+This post is dedicated to learn how Bayesian Optimization works and their application in various business and data science case. The algorithm will be run in R.
+
+## About
+
+## Learning Objectives
+
+* Learn how Bayesian Optimization works
+* Learn how to apply Bayesian Optimization in business and data science problem
+* Compare Bayesian Optimization with Particle Swarm Optimization
+
+## Library and Setup
+
+```{r message=FALSE, warning=FALSE}
+library(tidymodels)
+library(ranger)
+library(scales)
+library(GA)
+library(pso)
+library(tidyverse)
+library(rBayesianOptimization)
+library(lubridate)
+library(GPfit)
+
+# For Machine Learning
+library(tidytext)
+library(keras)
+library(RVerbalExpressions)
+library(textclean)
+
+options(scipen = 999)
+```
+
+# Bayesian Optimization: Concept
+
+The general procedure when works with Bayesian Optimization is as follows:
+
+```{r out.width="80%", echo=FALSE}
+knitr::include_graphics("asset/algorithm.png")
+```
+
+Bayesian Optimization consists of two main components: a Bayesian statistical model for modeling the objective function, and an acquisition function for deciding where to sample next. The Gaussian process is often employed for the statistical model due to its flexibility and tractability.
+
+## Gaussian Process
+
+The model used for approximating the objective function is called surrogate model. Gaussian process is one of them. Whenever we have an unknown value in Bayesian statistics, we suppose that it was drawn at random by nature from some prior probability distribution. Gaussian Process takes this prior distribution to be multivariate normal, with a specific mean vector and covariance matrix. 
+
+The prior distribution on $[f(x_1), f(x_2), ..., f(x_k)]$ is:
+
+$$f(x_{1:k}) \sim \mathcal{N} (\mu_0(x_{1:k}),\  \Sigma_0(x_{1:k}, x_{1:k})) $$
+
+$\mathcal{N}(x,y)$ : Gaussian/Normal random distribution
+
+$\mu_0(x_{i:k})$ : Mean function of each $x_i$. It is common to use $m(x)=0$ as Gaussian Process is flexible enough to model the mean arbitrarily well[^3]
+
+$\Sigma_0(x_{i:k},x_{i:k})$ : Kernel function/covariance function at each pair of $x_i$
+
+Gaussian process also provides a Bayesian posterior probability distribution that describes potential values for $f(x)$ at the candidate point $x$. Each time we observe f at a new point, this posterior distribution is updated. The Gaussian process prior distribution can be converted into posterior distirbution after having some observed some $f$ or $y$ values. 
+
+$$f(x)|f(x_{1:n}) \sim \mathcal{N} (\mu_n(x), \ \sigma_n^2(x))$$
+
+Where:
+
+$$\mu_n(x) = \Sigma_0(x,x_{i:n}) * \Sigma_0(x_{i:n},x_{i:n})^{-1} * (f(x_{1:n})-\mu_0(x_{1:n})) + \mu_0(x)$$
+
+$$\sigma_n^2(x) = \Sigma_0(x,x) - \Sigma_0(x,x_{i:n}) * \Sigma_0(x_{i:n},x_{i:n})^{-1} * \Sigma_0(x_{i:n},x)$$
+
+Below is the example of Gaussian Process posterior over function graph. The blue dot represent the fitness function of 3 sample points. The solid red line represent the estimate of the fitness function while the dashed line represent the Bayesian credible intervals (similar to confidence intervals). 
+
+```{r out.width="80%", echo=FALSE}
+knitr::include_graphics("asset/gp_posterior.png")
+```
+
+Let's illustrate the process with `GPfit` package. Suppose I have a function below:
+
+```{r}
+f <- function(x) {
+  f <- (2 * x - 10)^2 * sin(32 * x - 4)
+  return(f)
+}
+```
+
+Create noise-free $f$ for $n_0$ based on 5 points within range of [0,1].
+
+```{r}
+x <- c(0, 1/3, 1/2, 2/3, 1)
+
+eval <- data.frame(x = x, y = f(x)) %>% as.matrix()
+eval
+```
+
+Create a gaussian process with `GP_fit()` with power exponential correlation function. You can also use Matern correlation function `list(type = "matern", nu = 5/2)`[^4].
+
+```{r}
+fit <- GP_fit(X = eval[ , "x"], 
+              Y = eval[ , "y"], 
+              corr = list(type = "exponential", power = 1.95))
+```
+
+After we fitted GP model, we can calculate the expected value $μ(x)$ at each possible value of x and the corresponding uncertainty $σ(x)$. These will be used when computing the acquisition functions over the possible values of x.
+
+```{r}
+x_new <- seq(0, 1, length.out = 100)
+pred <- predict.GP(fit, xnew = data.frame(x = x_new))
+mu <- pred$Y_hat
+sigma <- sqrt(pred$MSE)
+```
+
+We can visualize the result.
+
+```{r}
+ggplot(as.data.frame(eval))+
+  geom_line(data = data.frame(x = x_new, y = mu),
+            aes(x = x, y = y), color = "red", linetype = "dashed")+
+  geom_ribbon(data = data.frame(x = x_new, y_up = mu + sigma, y_low = mu - sigma), 
+              aes(x = x_new, ymax = y_up, ymin = y_low), fill = "skyblue", alpha = 0.5) +
+  geom_point(aes(x,y), size = 2)+
+  theme_minimal() +
+  labs(title = "Gaussian Process Posterior of f(x)",
+       subtitle = "Blue area indicate the credible intervals",
+       y = "f(x)")
+```
+
+## Acquisition Function
+
+Acquisition function is employed to choose which point of $x$ that we will take the sample next. The chosen point is those with the optimum value of acquisition function. The acquisition function calculate the value that would be generated by evaluation of the fitness function at a new point $x$, based on the current posterior distribution over $f$. 
+
+Below is the illustration of the acquisition function value curve. The value is calculated using expected improvement method. Point with the highest value of the acquisition function will be sampled at the next round/iteration.
+
+```{r out.width="80%", echo=FALSE}
+knitr::include_graphics("asset/acquisition.png")
+```
+
+There are several choice of acquisition function, such as expected improvement, Gaussian Process upper confidence bound, entropy search, etc. Here we will illustrate the expected improvement function.
+
+$$EI(x) = \left\{
+\begin{array}{ll}
+      (\mu(x) - f(x^+) - \xi) \Phi(Z) + \sigma(x) \phi(Z) & if \ \sigma(x) > 0 \\
+      0 & if \ \sigma(x) = 0 \\
+\end{array} 
+\right. $$
+
+Where
+
+$$Z = \frac{\mu(x) - f(x^+) - \xi}{\sigma(x)}$$
+
+$f(x^+)$ : Best value of $f(x)$ of the sample
+
+$\mu(x)$ : Mean of the GP posterior predictive at $x$
+
+$\sigma(x)$ : Standard deviation of the GP posterior predictive at $x$
+
+$\xi$ : xi(some call epsilon instead). Determines the amount of exploration during optimization and higher ξ values lead to more exploration. A common default value for ξ is 0.01.
+
+$\Phi$ : The cumulative density function (CDF) of the standard normal distribution
+
+$\phi$ : The probability density function (PDF) of the standard normal distribution
+
+Suppose that `y_best` is the best fitness value from the sample
+```{r}
+y_best <- min(eval[,2])
+```
+
+We can use the code below to get the expected improvement value for each x. We will use epsilon value of 0.01.
+
+```{r}
+eps <- 0.01
+ei_calc <- function(m, s) {
+  if (s == 0) {
+    return(0)
+  }
+  Z <- (m - y_best - eps)/s
+  expected_imp <- (m - y_best - eps) * pnorm(Z) + s * dnorm(Z)
+  return(expected_imp)
+}
+
+expected_improvement <- numeric()
+for (i in 1:length(mu)) {
+  expected_improvement[i] <- ei_calc(m = mu[i],s =  sigma[i])
+}
+```
+
+Let's visualize the result. Create `data.frame` for the result and create `exp_best` which consists of x with the highest expected improvement value.
+
+```{r}
+exp_imp <- data.frame(x = x_new,
+                      y = expected_improvement)
+
+exp_best <- exp_imp %>% filter(y == max(y))
+```
+
+We can visualize the result
+
+```{r}
+ggplot(exp_imp, aes(x, y))+
+  geom_line()+
+  geom_ribbon(aes(ymin = 0, ymax = y), fill = "skyblue", alpha = 0.5, color = "white")+ 
+  geom_vline(xintercept = exp_best$x, linetype = "dashed", color = "red")+
+  geom_point(data = exp_best, size = 2)+
+  theme_minimal() +
+  theme(panel.grid = element_blank())+
+  scale_x_continuous(breaks = c(seq(0,1,0.25), round(exp_best$x,2)))+
+  labs(title = "Expected Improvement",
+       subtitle = "x with the highest expected improvement will be evaluated",
+       y = "Expected Improvement")
+```
+
+With this basic steps, I hope we are ready to apply Bayesian Optimization.
+
+# Bayesian Optimization in R
+
+We can do Bayesian optimization in R using `rBayesianOptimization` package.
+
+## Business Application
+
+### Finance: Portofolio Optimization
+
+The problem is replicated from Zhu et al.(2011)[^5]. The study employed a PSO algorithm for portfolio selection and optimization in investment management. 
+
+Portfolio optimization problem is concerned with managing the portfolio of assets that minimizes the risk objectives subjected to the constraint for guaranteeing a given level of returns. One of the fundamental principles of financial investment is diversification where investors diversify their investments into different types of assets. Portfolio diversification minimizes investors exposure to risks, and maximizes returns on portfolios. 
+
+The fitness function is the adjusted Sharpe Ratio for restricted portofolio, which combines the information from mean and variance of an asset and functioned as a risk-adjusted measure of mean return, which is often used to evaluate the performance of a portfolio. 
+
+The Sharpe ratio can help to explain whether a portfolio's excess returns are due to smart investment decisions or a result of too much risk. Although one portfolio or fund can enjoy higher returns than its peers, it is only a good investment if those higher returns do not come with an excess of additional risk.
+
+The greater a portfolio's Sharpe ratio, the better its risk-adjusted performance. If the analysis results in a negative Sharpe ratio, it either means the risk-free rate is greater than the portfolio’s return, or the portfolio's return is expected to be negative. 
+
+The fitness function is shown below:
+
+$$Max \  f(x) = \frac{\sum_{i=1}^{N} W_i*r_i - R_f}{\sum_{i=1}^{N}\sum_{j=1}^{N} W_i * W_j * \sigma_{ij}}$$
+
+**Subject To**
+
+$$\sum_{i=1}^{N} W_i = 1$$
+$$0 \leq W_i \leq 1$$
+$$i = 1, 2, ..., N$$
+
+$N$: Number of different assets
+
+$W_i$: Weight of each stock in the portfolio
+
+$r_i$: Return of stock i
+
+$R_f$: The test available rate of return of a risk-free security (i.e. the interest rate on a three-month U.S. Treasury bill)
+
+$\sigma_{ij}$: Covariance between returns of assets i and j, 
+
+Adjusting the portfolio weights $w_i$, we can maximize the portfolio Sharpe Ratio in effect balancing the trade-off between maximizing the expected return and at the same time minimizing the risk.
+
+#### Import Data
+
+Data is acquired from New York Stock Exchange on Kaggle (https://www.kaggle.com/dgawlik/nyse). We will only use data from January to March of 2015 for illustration. 
+
+```{r}
+nyse <- data.table::fread("data_input/prices.csv")
+
+nyse <- nyse %>% 
+  mutate(date = ymd(date)) %>% 
+  filter(year(date) == 2015,
+         month(date) %in% c(1:3))
+
+head(nyse)
+```
+
+To get clearer name of company, let's import the Ticker Symbol and Security.
+
+```{r}
+securities <- data.table::fread("data_input/securities.csv")
+securities <- securities %>% 
+  select(`Ticker symbol`, Security) %>% 
+  rename(stock = `Ticker symbol`)
+```
+
+Let's say I have assets in 3 different stocks. I will randomly choose the stocks.
+
+```{r}
+set.seed(13)
+selected_stock <- sample(nyse$symbol, 3)
+
+nyse <- nyse %>% 
+  filter(symbol %in% selected_stock)
+head(nyse)
+```
+
+#### Calculate Returns
+
+Let's calculate the daily returns.
+
+```{r}
+nyse <- nyse %>% 
+  select(date, symbol, close) %>% 
+  group_by(symbol) %>% 
+  rename(price = close) %>% 
+  mutate(price_prev = lag(price),
+         returns = (price - price_prev)/price_prev) %>% 
+  slice(-1) %>% 
+  ungroup()
+
+head(nyse)
+```
+
+Let's calculate the mean return of each stock.
+```{r}
+mean_stock <- nyse %>% 
+  group_by(symbol) %>% 
+  summarise(mean = mean(returns))
+```
+
+The value of $R_f$ is acquired from the latest interest rate on a three-month U.S. Treasury bill. Since the data is from 2016, we will use data from 2015 (Use data from March 27, 2015), which is 0.04%. The rate is acquired from https://ycharts.com/indicators/3_month_t_bill.
+```{r}
+rf <- 0.04/100
+```
+
+#### Covariance Matrix Between Portofolio
+
+Calculate the covariance matrix between portofolio. First, we need to separate the return of each portofolio into several column by spreading them.
+
+```{r}
+nyse_wide <- nyse %>%
+  pivot_wider(id_cols = c(date, symbol), names_from = symbol, values_from = returns) %>% 
+  select(-date)
+
+# Create Excess Return
+for (i in 1:n_distinct(nyse$symbol)) {
+  nyse_wide[,i]<- nyse_wide[,i] - as.numeric(mean_stock[i,2])
+}
+  
+head(nyse_wide)
+```
+
+Create the covariance matrix.
+
+```{r}
+nyse_cov <- cov(x = nyse_wide)
+```
+
+#### Define Fitness Function
+
+Let's define the fitness function. We will penalize the solution that violate the constraint. Higher penalty will increases accuracy and force the fitness value to get closer to the feasible area.
+
+```{r}
+fitness <- function(w1,w2,w3){
+  # Assign weight for each stocks
+  weight_stock <- c(w1,w2,w3)
+  
+ # Calculate the numerator
+ f1 <- numeric()
+ for (i in 1:n_distinct(nyse$symbol)) {
+   f1[i] <- weight_stock[i]*mean_stock$mean[i]
+ }
+   
+ # Calculate the denominator
+ f2 <- numeric()
+ for (i in 1:n_distinct(nyse$symbol)) {
+   f3 <- numeric()
+   
+   for (j in 1:n_distinct(nyse$symbol)) {
+    f3[j] <- weight_stock[i]*weight_stock[j]*nyse_cov[i,j]
+   }
+   
+ f2[i] <- sum(f3)
+ }
+
+  # Calculate Fitness Value
+ fitness <- (sum(f1)-rf)/sum(f2)
+
+ # Penalize Constraint Violation
+ fitness <- fitness - 1e9 * (round(sum(weight_stock),10)-1)^2
+
+ result <- list(Score = fitness, Pred = 0)
+ return(result)
+}
+```
+
+#### Define Parameters
+
+Let's define the search boundary
+```{r}
+search_bound <- list(w1 = c(0,1), w2 = c(0,1),
+                     w3 = c(0,1))
+```
+
+Let's set the initial sample 
+
+```{r}
+set.seed(123)
+search_grid <- data.frame(w1 = runif(20,0,1), 
+                          w2 = runif(20,0,1),
+                          w3 = runif(20,0,1))
+head(search_grid)
+```
+
+#### Run the Algorithm
+
+Use `BayesianOptimization()` function to employ the algorithm. The parameters include:
+
+* FUN : the fitness function
+* bounds : a list of lower and upper bound of each dimension/variables
+* init_grid_dt : User specified points to sample the target function
+* init_points : Number of randomly chosen points to sample the target function before Bayesian Optimization fitting the Gaussian Process
+* n_iter : number of repeated Bayesian Optimization
+* acq : Choice of acquisition function
+* kappa : tunable parameter kappa of GP Upper Confidence Bound, to balance exploitation against exploration, increasing kappa will make the optimized hyperparameters pursuing exploration.
+* eps : tunable parameter epsilon of Expected Improvement and Probability of Improvement, to balance exploitation against exploration, increasing epsilon will make the optimized hyperparameters are more spread out across the whole range.
+
+```{r}
+set.seed(1)
+tictoc::tic()
+bayes_finance <- BayesianOptimization(FUN = fitness, bounds = search_bound, 
+                     init_grid_dt = search_grid, init_points = 0, 
+                     n_iter = 10, acq = "ei")
+
+tictoc::toc()
+```
+ 
+Result of the function consists of a list with 4 components:
+
+* Best_Par : a named vector of the best hyperparameter set found
+* Best_Value :  the value of metrics achieved by the best hyperparameter set 
+* History : table of bayesian optimization history
+* Pred : table with validation/cross-validation prediction for each round of bayesian optimization history
+
+So, what is the optimum Sharpe Ratio from Bayesian optimization?
+```{r}
+bayes_finance$Best_Value
+```
+
+The greater a portfolio's Sharpe ratio, the better its risk-adjusted performance. If the analysis results in a negative Sharpe ratio, it either means the risk-free rate is greater than the portfolio’s return, or the portfolio's return is expected to be negative. 
+
+Let's check the total weight of the optimum result. 
+```{r}
+sum(bayes_finance$Best_Par)
+```
+
+Based on Bayesian Optimization, here is how your asset should be distributed. 
+
+```{r warning=FALSE}
+data.frame(stock = unique(nyse$symbol),
+           weight = bayes_finance$Best_Par) %>% 
+  arrange(desc(weight)) %>% 
+  mutate(weight = percent(weight, accuracy = 0.01)) %>% 
+  left_join(securities, by = "stock") %>% 
+  select(stock, Security, weight)
+```
+
+#### Change the Acquisition Function
+
+Let's try another Bayesian Optimization for the problem. We will change the acquisition function from expected improvement to Gaussian Process upper confidence limit.
+
+```{r}
+set.seed(1)
+tictoc::tic(1)
+bayes_finance <- BayesianOptimization(FUN = fitness, bounds = search_bound, 
+                     init_grid_dt = search_grid, init_points = 0, 
+                     n_iter = 10, acq = "ucb")
+
+tictoc::toc()
+```
+
+
+#### Compare With Particle Swarm Optimization
+
+Let's compare the optimum Sharpe Ratio from Bayesian Optimization with another algorithm: Particle Swarm Optimization. If you are unfamiliar with the method, you can visit my post[^6].
+
+Let's redefine the fitness function to suit the PSO from `pso` package.
+```{r}
+fitness <- function(x){
+  # Assign weight for each stocks
+  weight_stock <- numeric()
+  for (i in 1:n_distinct(nyse$symbol)) {
+    weight_stock[i] <- x[i]
+  }
+  
+ # Calculate the numerator
+ f1 <- numeric()
+ for (i in 1:n_distinct(nyse$symbol)) {
+   f1[i] <- weight_stock[i]*mean_stock$mean[i]
+ }
+   
+ # Calculate the denominator
+ f2 <- numeric()
+ for (i in 1:n_distinct(nyse$symbol)) {
+   f3 <- numeric()
+   
+   for (j in 1:n_distinct(nyse$symbol)) {
+    f3[j] <- weight_stock[i]*weight_stock[j]*nyse_cov[i,j]
+   }
+   
+ f2[i] <- sum(f3)
+ }
+
+  # Calculate Fitness Value
+ fitness <- (sum(f1)-rf)/sum(f2)
+
+ # Penalize Constraint Violation
+ fitness <- fitness - 1e9 * (round(sum(weight_stock),10)-1)^2
+ 
+ return(fitness)
+}
+```
+
+Let's run the PSO Algorithm. PSO will run for 10,000 iterations with swarm size of 100. If in 500 iterations there is no improvement on the fitness value, the algorithm will stop.
+
+```{r}
+tictoc::tic()
+set.seed(123)
+pso_finance <- psoptim(par = rep(NA,3), fn = function(x){-fitness(x)}, 
+        lower = rep(0,3), upper = rep(1,3), 
+        control = list(maxit = 10000, s = 100, maxit.stagnate = 500))
+
+pso_finance
+tictoc::toc()
+```
+
+The solutions has Sharpe Ratio of `r round(-pso_finance$value,3)`. 
+
+Let's check the total weight
+```{r}
+sum(pso_finance$par)
+```
+
+Based on PSO, here is how your asset should be distributed. 
+
+```{r warning=FALSE}
+data.frame(stock = unique(nyse$symbol),
+           weight = pso_finance$par) %>% 
+  arrange(desc(weight)) %>% 
+  mutate(weight = percent(weight, accuracy = 0.01)) %>% 
+  left_join(securities, by = "stock") %>% 
+  select(stock, Security, everything())
+```
+
+For this problem, PSO works better than Bayesian Optimization, indicated by the optimum fitness value. However, we only ran 40 function evalutions (20 from samples, 20 from iterations) with Bayesian Optimization, compared to PSO, which run more than 1000 evaluations. The trade-off is Bayesian Optimization ran slower than PSO, since the function evaluation is cheap. We will try in more complex problem via deep learning to see if the trade-off don't change.
+
+## Machine Learning Application
+
+We will try to classify whether a user will give a game an above average score based on the content of the reviews. We will use the neural network model. Reviews will be extracted using text mining approach. On this problem, we will optimize the hyper-parameter of the neural network. This problem is based on my previous post[^7].
+
+### Import Data
+
+The dataset is user reviews of 100 best PC games from <a href="https://www.metacritic.com/browse/games/score/metascore/all/pc/filtered?sort=desc"> metacritic </a> website. I already scraped the data, which you can download <a href="http://bit.ly/game_review"> here </a>.
+
+```{r}
+game_review <- data.table::fread("data_input/game_review.csv")
+head(game_review)
+```
+
+Since we will use keras to build the neural network architecture, we will set the environment first.
+```{r}
+# set conda env
+use_condaenv()
+```
+
+### Data Preprocessing
+
+We want to clean the text by removing url and any word elongation. We will replace "?" with "questionmark" and "!" with "exclamationmark" to see if these characters can be useful in our analysis, etc.
+```{r regex,echo=TRUE}
+question <- rx() %>% 
+  rx_find(value = "?") %>% 
+  rx_one_or_more()
+
+exclamation <- rx() %>% 
+  rx_find(value = "!") %>% 
+  rx_one_or_more()
+
+punctuation <- rx_punctuation()
+
+number <- rx_digit()
+
+dollar <- rx() %>% 
+  rx_find("$")
+```
+
+```{r echo=TRUE}
+game_review <- game_review %>% 
+  mutate(
+    text_clean = review %>% 
+      replace_url() %>% 
+      replace_html() %>% 
+      replace_contraction() %>% 
+      replace_word_elongation() %>% 
+      str_replace_all(pattern = question, replacement = " questionmark ") %>% 
+      str_replace_all(pattern = exclamation, replacement = " exclamationmark ") %>% 
+      str_remove_all(pattern = punctuation) %>% 
+      str_remove_all(pattern = number) %>% 
+      str_remove_all(pattern = dollar) %>% 
+      str_to_lower() %>% 
+      str_squish()
+  )
+game_review
+```
+
+Since we want to classify the score into above average or below average, we need to add the label into the data.
+
+```{r echo=TRUE, warning=FALSE}
+#Remove game with only 1 review
+more_1 <- game_review %>% group_by(game) %>% summarise(total = n()) %>% filter(total > 1)
+game_review <- game_review[game_review$game %in% more_1$game,]
+
+x <- game_review %>% 
+  mutate(game = factor(game,unique(game))) %>% 
+  group_by(game) %>% 
+  summarise(game_mean = mean(score))
+  
+#Label the data with above average/below average
+game_clean <- game_review %>% left_join(x) %>% 
+  mutate(above_average = if_else(score > game_mean, "Above", "Below")) %>% 
+  mutate(above_average = factor(above_average,c("Below","Above"))) %>% 
+  select(V1,above_average,text_clean) %>% 
+  na.omit()
+
+game_clean
+```
+
+Finally, we will make a document term matrix, with the row indicate each review and the columns consists of top 1024 words in the entire reviews. We will use the matrix to classify if the user will give an above average score based on the appearance of one or more terms.
+
+```{r dtm,echo=TRUE, warning=FALSE}
+game_token <- game_clean %>% 
+  unnest_tokens(word,text_clean)
+
+game_tidy <- game_token %>% 
+  anti_join(stop_words) %>% 
+  count(V1,above_average,word) 
+
+top_word <- game_tidy %>% 
+  count(word,sort = T) %>%
+  top_n(1024) %>% select(word)
+
+game_tidy <- game_tidy %>% inner_join(top_word)
+game.y <- game_tidy %>% group_by(V1,above_average) %>% 
+  summarise(total=n()) %>% 
+  select(V1,above_average) %>% as.matrix()
+
+game_dtm <- game_tidy %>% cast_dtm(document = V1,term = word,value = n)
+game.x <- as.matrix(game_dtm)
+game.x <- as.data.frame(game.x)
+game_data <- cbind(game.y,game.x)
+game_data <- game_data %>% select(-V1)
+
+head(game_data)
+```
+
+### Cross-Validation
+
+We will split the data into training set, validation set, and testing set. First, we split the data into training set and testing set.
+
+```{r}
+set.seed(123)
+game_data$above_average <- factor(game_data$above_average,levels = c("Above","Below"))
+intrain <- initial_split(game_data, prop = .8,strata = "above_average")
+```
+
+### Further Data Preprocessing
+
+We will balance the class in the training set and normalize all numeric features. Then we split the testing set into validation set and the testing test itself.
+```{r}
+rec <- recipe(above_average~.,training(intrain)) %>% 
+  step_downsample(above_average, ratio = 1/1, seed = 123) %>% 
+  step_center(all_numeric(),-above_average) %>% 
+  step_scale(all_numeric(),-above_average) %>% 
+  prep(strings_as_factors = F)
+
+data_train <- juice(rec)
+data_test <- bake(rec,testing(intrain))
+
+valtes <- initial_split(data_test, prop = .5, strata = "above_average")
+data_val <- training(valtes)
+data_test <- testing(valtes)
+
+prop.table(table(data_train$above_average))
+```
+
+We adjust the data to get a proper structure before we fed them into keras.
+```{r}
+data_train_x <- data.matrix(data_train %>% select(-above_average))
+data_test_x <- data.matrix(data_test %>% select(-above_average))
+data_val_x <- data.matrix(data_val %>% select(-above_average))
+
+data_train_y <- to_categorical((as.numeric(data_train$above_average)-1),num_classes = 2)
+data_test_y <- to_categorical((as.numeric(data_test$above_average)-1),num_classes = 2)
+data_val_y <- to_categorical((as.numeric(data_val$above_average)-1),num_classes = 2)
+```
+
+### Define Fitness Function
+
+We will build the neural network architecture. Our model would have several layers. There are layer dense which will scale our data using the `relu` activation function on the first and second layer dense. There are also layer dropout to prevent the model from overfitting. Finally, we scale back our data into range of [0,1] with the sigmoid function as the probability of our data belong to a particular class. The epoch represent the number of our model doing the feed-forward and back-propagation.
+
+We will try to optimize the dropout rate on the 1st and 2nd layer dropout. We will also optimize the learning rate.
+
+```{r}
+keras_fit <- function(dropout_1, dropout_2, learning_rate){
+
+model <- keras_model_sequential()
+model %>%
+  layer_dense(units = 64, activation = "relu", input_shape = c(1031)) %>%
+  layer_dropout(rate = dropout_1, seed = 123) %>% 
+  layer_dense(units = 16, activation = "relu") %>% 
+  layer_dropout(rate = dropout_2, seed = 123) %>% 
+  layer_dense(units = 2, activation = "sigmoid")
+
+model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = optimizer_adamax(lr = learning_rate),
+  metrics = c('accuracy')
+)
+
+history <- model %>% fit(
+  data_train_x, data_train_y,
+  batch_size = 128, 
+  epochs = 15,
+  verbose = 0,
+  validation_data = list(
+    data_val_x, data_val_y
+  )
+)
+
+result <- list(Score = history$metrics$val_accuracy[15], 
+               Pred = 0)
+
+return(result)
+}
+```
+
+### Define Parameters
+
+Define the search boundary
+```{r}
+search_bound_keras <- list(dropout_1 = c(0,0.7),
+                           dropout_2 = c(0,0.7),
+                           learning_rate = c(0, 1))
+```
+
+Define initial search sample
+```{r}
+set.seed(123)
+search_grid_keras <- data.frame(dropout_1 = runif(20, 0, 0.7),
+                                dropout_2 = runif(20, 0, 0.7),
+                                learning_rate = runif(20, 0, 1))
+head(search_grid_keras)
+```
+
+### Run the Algorithm
+
+We will run the Bayesian Optimization with 20 iterations. 
+
+```{r}
+set.seed(123)
+tictoc::tic()
+bayes_keras <- BayesianOptimization(FUN = keras_fit, bounds = search_bound_keras, 
+                     init_points = 0, init_grid_dt = search_grid_keras, 
+                     n_iter = 30, acq = "ucb")
+tictoc::toc()
+```
+
+The best hyper-parameter so far from Bayesian Optimization with `r percent(bayes_keras$Best_Value, accuracy = 0.01)` accuracy on validation set.
+
+```{r}
+data.frame(hyperparameter = c("Dropout Rate in 1st Layer Dropout", "Dropout Rate in 2nd Layer Dropout", "Learning Rate"),
+           value = c(bayes_keras$Best_Par[1], bayes_keras$Best_Par[2],
+                     bayes_keras$Best_Par[3]), row.names = NULL)
+```
+
+### Compare with Particle Swarm Optimization
+
+First we need to readjust the fitness function to suit Particle Swarm Optimization
+
+```{r}
+keras_fit <- function(x){
+
+model <- keras_model_sequential()
+model %>%
+  layer_dense(units = 64, activation = "relu",input_shape = c(1031)) %>%
+  layer_dropout(rate = x[1], seed = 123) %>% 
+  layer_dense(units = 16, activation = "relu") %>% 
+  layer_dropout(rate = x[2], seed = 123) %>% 
+  layer_dense(units = 2, activation = "sigmoid")
+
+model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = optimizer_adamax(lr = x[3]),
+  metrics = c('accuracy')
+)
+
+history <- model %>% fit(
+  data_train_x, data_train_y,
+  batch_size = 128, 
+  epochs = 15,
+  verbose = 0,
+  validation_data = list(
+    data_val_x, data_val_y
+  )
+)
+
+result <- history$metrics$val_accuracy[15]
+return(result)
+}
+```
+
+Let's run the algorithm. See if it can get better solution than Bayesian Optimization. PSO will run in 100 iterations with 10 particles. If in 10 iterations PSO did not improve, the algorithm stop.
+
+```{r}
+set.seed(123)
+tictoc::tic()
+pso_keras <- psoptim(par = rep(NA, 3), fn = function(x) {-keras_fit(x)}, 
+                     lower = c(0, 0, 0), upper = c(0.7, 0.7, 1), 
+                     control = list(maxit = 100, s = 10, maxit.stagnate = 10))
+tictoc::toc()
+```
+
+```{r}
+pso_keras
+```
+
+PSO require more runtime since each function evaluation is heavy. The optimum accuracy (`r percent(-pso_keras$value, accuracy = 0.001)`) is slightly below those of Bayesian Optimization.
+
+# Conclusion
+
+Bayesian Optimization is a method of optimization that apply probabilistic statistical model that will obtain optimum value with minimal number of function evaluation. It is best suited for problem with costly function evaluation, such as hyper-parameter tuning for deep learning model. Compared to Particle Swarm Optimization, Bayesian optimization perform worse in portofolio optimization with longer runtime, but lower number of function evaluation. Since the function evaluation is not costly in these problem, PSO outperformed the Bayesian. Meanwhile for deep learning, Bayesian optimization outperform PSO runtime with close optimum validation accuracy. Number of iterations may influence the result in Bayesian optimization. 
+
+# Reference
+
+[^1]: [Practical Bayesian Optimization of Machine Learning Algorithms](https://arxiv.org/abs/1206.2944)
+[^2]: [A tutorial on Bayesian Optimization](https://arxiv.org/pdf/1807.02811.pdf)
+[^3]: [Gaussian Processes](http://krasserm.github.io/2018/03/19/gaussian-processes/)
+[^4]: [A tutorial on Bayesian optimization in R](https://bearloga.github.io/bayesopt-tutorial-r/)
+[^5]: [Zhu, H., Wang, Y., Wang, K., & Chen, Y. (2011). Particle Swarm Optimization (PSO) for the constrained portfolio optimization problem](https://dl.acm.org/citation.cfm?id=1968112)
+[^6]: [Introduction to Particle Swarm Optimization](http://rpubs.com/Argaadya/intro-PSO)
+[^7]: [User Score Classification with Neural Network and Keras](http://rpubs.com/Argaadya/536043)
